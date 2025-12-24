@@ -1,0 +1,21 @@
+[build-system]
+requires = ["hatchling >= 1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "aegix"
+version = "0.1.0"
+dependencies = [
+  "typer",
+  "docker",
+]
+requires-python = ">=3.10"
+authors = [
+  {name = "Tongtong Zhu", email = "ttongg.zhu@gmail.com"},
+]
+description = "A secure, observable sandbox runtime for agent tool execution."
+readme = "README.md"
+license = "Apache-2.0"
+
+[project.scripts]
+aegix = "aegix.cli:app"

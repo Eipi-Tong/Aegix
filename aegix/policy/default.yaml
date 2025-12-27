@@ -1,0 +1,42 @@
+version: 1
+
+network:
+  mode: "none"  # none | bridge | host | allowlist (week4)
+  allowlist: [] # only used if mode is allowlist (week4)
+
+fs:
+  write_paths:
+    - "/workspace"
+  read_only_paths: []
+
+limits:
+  default:
+    timeout_s: 30
+    cpu: 1.0
+    mem_mb: 512
+    pids: 256
+  
+  per_tool:
+    bash:
+      timeout_s: 20
+    python:
+      timeout_s: 30
+      mem_mb: 768
+  
+commands:
+  # deny 比 allow 优先级更高（更安全、也更好解释）
+  deny_cmd_patterns:
+    - "(?i)\\bsudo\\b"
+    - "(?i)\\bssh\\b"
+    - "(?i)\\bscp\\b"
+    - "(?i)\\bcurl\\b"
+    - "(?i)\\bwget\\b"
+    - "(?i)\\bnc\\b"
+    - "(?i)\\bnetcat\\b"
+    - "(?i)\\bapt(-get)?\\b"
+    - "(?i)\\byum\\b"
+    - "(?i)\\bpip\\s+install\\b"
+    - "(?i)\\brm\\s+-rf\\s+/(\\s|$)"  # rm -rf /
+  # 如果你填了 allow_cmd_patterns，则进入 allowlist 模式（更严格）
+  allow_cmd_patterns: []
+

@@ -10,110 +10,189 @@ from aegix.io.artifacts import ArtifactWriter
 from aegix.logging.audit import AuditLogger
 from aegix.runtime.docker_backend import DockerBackend, ExecResult
 
-@dataclass(frozen=True)
-class RunConfig:
-    cmd: str
-    image: str = "python:3.11-slim"
+# from aegix.models import ToolCall, ToolContext
+from aegix.policy import PolicyEngine
+from aegix.errors import AegixError
 
-@dataclass(frozen=True)
-class RunResult:
-    run_id: str
-    run_dir: str
-    exit_code: int
-    stderr_tail: str
+
+@dataclass
+class ToolResult:
+    ok: bool
+    exec_result: Optional[ExecResult] = None
+    error: Optional[AegixError] = None
+
 
 class ToolRouter:
-    def __init__(self, run_dir: Path = Path("runs")) -> None:
-        self.run_dir = run_dir
-        self.backend = DockerBackend()
+    def __init__(self, policy_engine: PolicyEngine, backend: DockerBackend, auditor: AuditLogger, artifacts: ArtifactWriter, default_image: str = "python:3.11-slim"):
+        self.policy = policy_engine
+        self.backend = backend
+        self.auditor = auditor
+        self.artifacts = artifacts
+        self.default_image = default_image
 
-    def _new_run_id(self) -> str:
-        ts = time.strftime("%Y%m%d_%H%M%S")
-        short = uuid.uuid4().hex[:8]
-        return f"{ts}_{short}"
+    def handle(self, call, ctx, run_dir: Path) -> ToolResult:
+        run_id = getattr(ctx, "run_id", None)
 
-    def handle(self, cfg: RunConfig) -> RunResult:
-        run_id = self._new_run_id()
-        run_dir = self.run_dir / run_id
-        artifacts_dir = run_dir / "artifacts"
-        run_dir.mkdir(parents=True, exist_ok=True)
-        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        self.auditor.log("RUN_START", {
+            "run_id": run_id,
+            "tool_name": getattr(call, "tool_name", None),
+        })
 
-        writer = ArtifactWriter(run_dir=run_dir)
-        audit = AuditLogger(events_path=run_dir / "events.jsonl")
+        # ---------- VALIDATION ----------
+        err = self._validate(call)
+        if err:
+            self.auditor.log("VALIDATION_ERROR", {"run_id": run_id, "error": err.__dict__})
+            self._write_report(ctx, call, ok=False, error=err)
+            self.auditor.log("RUN_END", {"run_id": run_id, "ok": False, "error_type": err.type})
+            return ToolResult(ok=False, error=err)
 
-        # ---- Run Start ----
-        audit.log("RUN_START", {"cmd": cfg.cmd, "image": cfg.image})
+        # ---------- POLICY ----------
+        decision = self.policy.evaluate(call, ctx)
 
-        # ---- Validation ----
-        cmd = (cfg.cmd or "").strip()
-        if not cmd:
-            audit.log("RUN_ERROR", {"status": "error", "reason": "empty command"})
-            writer.write_text("artifacts/stderr.txt", "Error: Empty command\n")
-            writer.write_text("artifacts/exit_code.txt", "2\n")
-            return RunResult(
-                run_id=run_id,
-                run_dir=str(run_dir),
-                exit_code=2,
-                stderr_tail="Error: Empty command"
+        self.auditor.log("POLICY_EVALUATED", {
+            "run_id": run_id,
+            "allow": decision.allow,
+            "reason": decision.reason,
+        })
+
+        if not decision.allow:
+            err = AegixError(
+                type="DENIED_POLICY",
+                message=decision.reason,
             )
-        
-        # ---- Policy Check ----
-        # In this MVP, we allow all commands in this example.
-        audit.log("POLICY_ALLOW", {"reason": "default allow all"})
+            self.auditor.log("POLICY_DENY", {"run_id": run_id, "reason": decision.reason})
+            self._write_report(ctx, call, ok=False, error=err, policy_reason=decision.reason)
+            self.auditor.log("RUN_END", {"run_id": run_id, "ok": False, "error_type": err.type})
+            return ToolResult(ok=False, error=err)
 
-        # ---- Execution ----
+        self.auditor.log("POLICY_ALLOW", {"run_id": run_id, "reason": decision.reason})
+
+        # ---------- EXEC ----------
         container_id: Optional[str] = None
-        start = time.time()
         try:
-            container_id = self.backend.create(image=cfg.image)
-            audit.log("EXEC_START", {"container_id": container_id})
+            image = getattr(call, "image", None) or self.default_image
 
-            exec_res: ExecResult = self.backend.exec(
-                container_id=container_id,
-                cmd=cmd,
-            )
-            dur_ms = int((time.time() - start) * 1000)
-            audit.log("EXEC_END", {
-                "container_id": container_id, 
-                "exit_code": exec_res.exit_code,
-                "dur_ms": dur_ms,
+            self.auditor.log("SANDBOX_CREATE_START", {"run_id": run_id, "image": image})
+            container_id = self.backend.create(image=image)
+            self.auditor.log("SANDBOX_CREATE_END", {"run_id": run_id, "container_id": container_id})
+
+            self.auditor.log("EXEC_START", {
+                "run_id": run_id,
+                "container_id": container_id,
+                "cmd": getattr(call, "cmd", ""),
             })
 
-            # ---- Persist Artifacts ----
-            writer.write_text("meta.json", writer.json_dumps({
-                "run_id": run_id,
-                "cmd": cmd,
-                "image": cfg.image,
-            }))
-            writer.write_text("artifacts/stdout.txt", exec_res.stdout)
-            writer.write_text("artifacts/stderr.txt", exec_res.stderr)
-            writer.write_text("artifacts/exit_code.txt", f"{exec_res.exit_code}\n")
-            audit.log("RUN_END", {"status": "ok", "exit_code": exec_res.exit_code})
+            res = self.backend.exec(container_id=container_id, cmd=getattr(call, "cmd", ""))
 
-            stderr_tail = (exec_res.stderr or "").splitlines()[-10:]  # last 10 lines
-            return RunResult(
-                run_id=run_id,
-                run_dir=str(run_dir),
-                exit_code=exec_res.exit_code,
-                stderr_tail="\n".join(stderr_tail),
+            self.auditor.log("EXEC_END", {
+                "run_id": run_id,
+                "container_id": container_id,
+                "exit_code": res.exit_code,
+                "stdout_len": len(res.stdout or ""),
+                "stderr_len": len(res.stderr or ""),
+            })
+
+            # artifacts
+            self.artifacts.write_text("stdout.txt", res.stdout or "")
+            self.artifacts.write_text("stderr.txt", res.stderr or "")
+            self.artifacts.write_text("exit_code.txt", f"{res.exit_code}\n")
+
+            if res.exit_code != 0:
+                err = AegixError(
+                    type="NONZERO_EXIT",
+                    message="Command exited with non-zero status",
+                    exit_code=res.exit_code,
+                )
+                self._write_report(ctx, call, ok=False, error=err, exec_result=res, policy_reason=decision.reason)
+                self.auditor.log("RUN_END", {"run_id": run_id, "ok": False, "exit_code": res.exit_code})
+                return ToolResult(ok=False, exec_result=res, error=err)
+
+            self._write_report(ctx, call, ok=True, exec_result=res, policy_reason=decision.reason)
+            self.auditor.log("RUN_END", {"run_id": run_id, "ok": True, "exit_code": res.exit_code})
+            return ToolResult(ok=True, exec_result=res)
+
+        except TimeoutError as e:
+            err = AegixError(
+                type="TIMEOUT",
+                message=str(e),
             )
-        
+            self.auditor.log("EXEC_TIMEOUT", {"run_id": run_id, "message": str(e)})
+            self._write_report(ctx, call, ok=False, error=err)
+            self.auditor.log("RUN_END", {"run_id": run_id, "ok": False, "error_type": err.type})
+            return ToolResult(ok=False, error=err)
+
         except Exception as e:
-            audit.log("RUN_END", {"status": "error", "reason": str(e)})
-            writer.write_text("artifacts/stderr.txt", f"{type(e).__name__}: {str(e)}\n")
-            writer.write_text("artifacts/exit_code.txt", "1\n") 
-            return RunResult(
-                run_id=run_id,
-                run_dir=str(run_dir),
-                exit_code=1,
-                stderr_tail=f"Error during execution: {str(e)}"
+            err = AegixError(
+                type="BACKEND_ERROR",
+                message=f"{type(e).__name__}: {e}",
             )
-        
+            self.auditor.log("BACKEND_ERROR", {"run_id": run_id, "message": err.message})
+            self._write_report(ctx, call, ok=False, error=err)
+            self.auditor.log("RUN_END", {"run_id": run_id, "ok": False, "error_type": err.type})
+            return ToolResult(ok=False, error=err)
+
         finally:
             if container_id:
                 try:
+                    self.auditor.log("SANDBOX_DESTROY_START", {
+                        "run_id": run_id,
+                        "container_id": container_id,
+                    })
                     self.backend.destroy(container_id)
-                except Exception:
-                    # best effort cleanup
-                    pass
+                    self.auditor.log("SANDBOX_DESTROY_END", {
+                        "run_id": run_id,
+                        "container_id": container_id,
+                    })
+                except Exception as e:
+                    self.auditor.log("SANDBOX_DESTROY_FAILED", {
+                        "run_id": run_id,
+                        "container_id": container_id,
+                        "message": f"{type(e).__name__}: {e}",
+                    })
+
+    # ---------------- helpers ----------------
+
+    def _validate(self, call) -> Optional[AegixError]:
+        if not getattr(call, "tool_name", None):
+            return AegixError("INVALID_TOOL_CALL", "tool_name is required")
+
+        if not getattr(call, "cmd", None) or not str(call.cmd).strip():
+            return AegixError("INVALID_TOOL_CALL", "cmd is required")
+
+        return None
+
+    def _write_report(
+        self,
+        ctx,
+        call,
+        ok: bool,
+        error: Optional[AegixError] = None,
+        exec_result: Optional[ExecResult] = None,
+        policy_reason: Optional[str] = None,
+    ) -> None:
+        report: Dict[str, Any] = {
+            "run_id": getattr(ctx, "run_id", None),
+            "ok": ok,
+            "tool": {
+                "tool_name": getattr(call, "tool_name", None),
+                "image": getattr(call, "image", None) or self.default_image,
+                "cmd": getattr(call, "cmd", None),
+            },
+            "policy": {"reason": policy_reason},
+        }
+
+        if exec_result is not None:
+            report["exec"] = {
+                "exit_code": exec_result.exit_code,
+                "stdout_len": len(exec_result.stdout or ""),
+                "stderr_len": len(exec_result.stderr or ""),
+            }
+
+        if error is not None:
+            report["error"] = {
+                "type": error.type,
+                "message": error.message,
+                "exit_code": error.exit_code,
+            }
+
+        self.artifacts.write_text("report.json", self.artifacts.json_dumps(report))

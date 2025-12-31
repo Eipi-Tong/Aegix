@@ -1,6 +1,6 @@
 # Aegix
 
-![](./pictures/aegix-logo.png)
+![](./assets/aegix-logo.png)
 
 > A secure, observable execution runtime for AI agent tools.
 

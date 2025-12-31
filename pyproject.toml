@@ -9,6 +9,7 @@ dependencies = [
   "typer",
   "docker",
   "PyYAML",
+  "openai"
 ]
 requires-python = ">=3.10"
 authors = [
@@ -18,5 +19,9 @@ description = "A secure, observable sandbox runtime for agent tool execution."
 readme = "README.md"
 license = "Apache-2.0"
 
+[tool.hatch.build.targets.wheel]
+packages = ["aegix_agent", "aegix_core", "aegix_cli"]
+
 [project.scripts]
-aegix = "aegix.cli:app"
+aegix = "aegix_cli.main:app"
+

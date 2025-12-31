@@ -1,6 +1,8 @@
 # Aegix
 
-> A secure, observable sandbox runtime for agent tool execution.
+![](./pictures/aegix-logo.png)
+
+> A secure, observable execution runtime for AI agent tools.
 
 > Staging: MVP
 
